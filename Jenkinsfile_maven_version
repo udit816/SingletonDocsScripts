@@ -1,0 +1,99 @@
+pipeline {
+    environment {
+        gitUrl = "gitlab.com/ctsd/mapps.git"
+
+		imageTag = "latest-master"
+        srnPattern = "DENAVE.1-1-1.{}"
+        nexusUsername = credentials('NEXUS_USER')
+        nexusPassword = credentials('NEXUS_PASSWORD')
+    }
+
+    agent any
+    tools {
+        maven 'M3'
+        jdk 'OpenJDK11'
+    }
+    stages {
+        stage('Extract SRN') {
+            steps {
+                script {
+                    // Default value definition. May be overridden in environment section.
+                    env.masterBranch = env.masterBranch != null ? env.masterBranch : "master"
+
+                    def project = parsePom(readFile('pom.xml'))
+
+                    env.projectVersion = project.version.text().replace("-SNAPSHOT", "")
+                    env.nextSnapshotVersion = incrementVersion(env.projectVersion) + "-SNAPSHOT"
+                    env.releaseSrn = srnPattern.replace("{}", env.projectVersion)
+                }
+            }
+        }
+        stage('Build Release') {
+            steps {
+                withCredentials([usernameColonPassword(credentialsId: 'GithubPushUser', variable: 'USERPASS')]) {
+                    sh '''git config --global user.name "charlycubic" '''
+                    sh '''git config --global user.email "charlycubic@cubic.com" '''
+
+                    sh '''mvn versions:set -DnewVersion=${projectVersion} -DprocessAllModules=true'''
+
+                    sh '''
+                    mvn package -Dproject.srn=${releaseSrn} -T 8 -s settings.xml
+                    mvn -pl all dockerfile:build -DnexusUsername=${nexusUsername} -DnexusPassword=${nexusPassword} -Ddocker.image.tag=${imageTag} -Dmaven.test.skip=false -s settings.xml
+                       '''
+                }
+            }
+        }
+        stage('Create Release') {
+            steps {
+                withCredentials([usernameColonPassword(credentialsId: 'GithubPushUser', variable: 'USERPASS')]) {
+                    // complete the release
+                    sh '''
+                            git add -A
+                            git commit -m "[release] prepare release ${projectVersion}"
+                            git tag ${releaseSrn}
+                            git push https://$USERPASS@${gitUrl} tag ${releaseSrn}
+                       '''
+
+                    // prepare the next snapshot release
+                    sh '''
+                            mvn versions:set -DnewVersion=${nextSnapshotVersion} -DprocessAllModules=true
+                            git add -A
+                            git commit -m "[release] prepare next snapshot release ${nextSnapshotVersion}"
+                            git push https://$USERPASS@${gitUrl}
+                       '''
+                }
+            }
+        }
+        stage('Merge Next Snapshot To develop') {
+            steps {
+                withCredentials([usernameColonPassword(credentialsId: 'GithubPushUser', variable: 'USERPASS')]) {
+                    sh '''
+                        git checkout develop
+                        git pull https://$USERPASS@${gitUrl}
+                        git merge ${masterBranch}
+                        git push https://$USERPASS@${gitUrl}
+                        git checkout ${releaseSrn}
+                    '''
+                }
+            }
+        }
+    }
+}
+
+static def parsePom(file) {
+    return new XmlSlurper(false, false).parseText(file)
+}
+
+/**
+ * Increments the minor version part for a given version string like "major.minor.patch".
+ * The result is "major.minor+1.0".
+ */
+static def incrementVersion(version) {
+    def minorAndPatch = version.substring(version.indexOf('.') + 1)
+    def minor = minorAndPatch.substring(0, minorAndPatch.indexOf('.'))
+    def minorIncremented = minor.toInteger() + 1
+    def major = version.substring(0, version.indexOf('.'))
+    def result = major + "." + minorIncremented + ".0"
+
+    return result
+}
